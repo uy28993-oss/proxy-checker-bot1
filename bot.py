@@ -2,10 +2,12 @@ import socket
 import ssl
 import threading
 import ipaddress
+import os
+import tempfile
 from queue import Queue
+
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
-import tempfile
 
 # ===== BOT TOKEN =====
 TOKEN = os.getenv("TOKEN")
@@ -14,27 +16,140 @@ TOKEN = os.getenv("TOKEN")
 q = Queue()
 lock = threading.Lock()
 
-
 # ===== LOAD TARGETS =====
 def load_targets(source):
-    targets = []
-
     try:
         if "/" in source:
             net = ipaddress.ip_network(source, strict=False)
-            targets = [str(ip) for ip in net.hosts()]
+            return [str(ip) for ip in net.hosts()]
         else:
-            targets = [source]
+            return [source]
     except:
-        pass
-
-    return targets
-
+        return []
 
 # ===== CDN DETECTION =====
 def detect_cdn(response):
     r = response.lower()
+    if "cloudflare" in r:
+        return "Cloudflare"
+    elif "cloudfront" in r:
+        return "Cloudfront"
+    elif "google" in r or "gws" in r:
+        return "Google"
+    return "Unknown"
 
+# ===== SCANNER WORKER =====
+def scan_worker(host, timeout, chat_id, bot, results):
+    while not q.empty():
+        ip, port = q.get()
+
+        try:
+            sock = socket.create_connection((ip, port), timeout=timeout)
+            context_ssl = ssl.create_default_context()
+            ssock = context_ssl.wrap_socket(sock, server_hostname=host)
+
+            payload = f"GET / HTTP/1.1\r\nHost: {host}\r\n\r\n"
+            ssock.sendall(payload.encode())
+
+            resp = ssock.recv(4096).decode(errors="ignore")
+            ssock.close()
+
+            if "200" in resp or "101" in resp:
+                cdn = detect_cdn(resp)
+                result = f"{ip}:{port} | {cdn}"
+
+                with lock:
+                    results.append(result)
+
+                bot.send_message(chat_id=chat_id, text=f"✅ {result}")
+
+        except:
+            pass
+
+        q.task_done()
+
+# ===== COMMAND =====
+async def scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        args = context.args
+
+        if len(args) < 3:
+            await update.message.reply_text(
+                "Usage:\n/scan host cidr ports\n\nExample:\n/scan example.com 1.1.1.0/24 443,80"
+            )
+            return
+
+        host = args[0]
+        source = args[1]
+        ports = [int(p) for p in args[2].split(",")]
+
+        timeout = 5
+        threads = 100
+
+        targets = load_targets(source)
+
+        if not targets:
+            await update.message.reply_text("❌ Invalid target")
+            return
+
+        await update.message.reply_text(
+            f"🚀 Scan started\nTargets: {len(targets)}\nPorts: {ports}"
+        )
+
+        results = []
+
+        # fill queue
+        for ip in targets:
+            for port in ports:
+                q.put((ip, port))
+
+        # start threads
+        for _ in range(threads):
+            threading.Thread(
+                target=scan_worker,
+                args=(host, timeout, update.effective_chat.id, context.bot, results),
+                daemon=True
+            ).start()
+
+        # wait until done (non-blocking safe)
+        while not q.empty():
+            await asyncio.sleep(1)
+
+        # save results
+        with tempfile.NamedTemporaryFile(delete=False, mode="w", suffix=".txt") as f:
+            for r in results:
+                f.write(r + "\n")
+            filename = f.name
+
+        await update.message.reply_text("✅ Scan completed")
+
+        await context.bot.send_document(
+            chat_id=update.effective_chat.id,
+            document=open(filename, "rb")
+        )
+
+    except Exception as e:
+        await update.message.reply_text(f"Error: {e}")
+
+# ===== START =====
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🤖 HOST SCANNER BOT\n\nUse:\n/scan host cidr ports\n\nExample:\n/scan example.com 1.1.1.0/24 443,80"
+    )
+
+# ===== MAIN =====
+def main():
+    app = ApplicationBuilder().token(TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("scan", scan))
+
+    print("Bot running...")
+    app.run_polling()
+
+if __name__ == "__main__":
+    import asyncio
+    main()
     if "cloudflare" in r:
         return "Cloudflare"
     elif "cloudfront" in r:
