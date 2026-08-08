@@ -1,40 +1,166 @@
-import asyncio
+import socket
+import ssl
+import threading
 import ipaddress
-import os
+from queue import Queue
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+import tempfile
 
-# ===== TOKEN =====
-TOKEN = os.getenv("TOKEN") 
-TIMEOUT = 3
-CONCURRENCY = 200
+# ===== BOT TOKEN =====
+TOKEN = os.getenv("TOKEN")
 
-# CDN detection
-CDN_MAP = {
-    "cloudflare": "cloudflare",
-    "cloudfront": "cloudfront",
-    "google": "google",
-    "akamai": "akamai",
-    "fastly": "fastly"
-}
-
-user_data_store = {}
-
-# ===== CDN DETECT =====
-def detect_cdn(data):
-    data = data.lower()
-    for key in CDN_MAP:
-        if key in data:
-            return CDN_MAP[key]
-    return "unknown"
+# ===== GLOBAL =====
+q = Queue()
+lock = threading.Lock()
 
 
-# ===== CHECK PROXY =====
-async def check_proxy(ip, port, sem, results):
+# ===== LOAD TARGETS =====
+def load_targets(source):
+    targets = []
+
     try:
-        async with sem:
-            reader, writer = await asyncio.wait_for(
-                asyncio.open_connection(ip, port), timeout=TIMEOUT
+        if "/" in source:
+            net = ipaddress.ip_network(source, strict=False)
+            targets = [str(ip) for ip in net.hosts()]
+        else:
+            targets = [source]
+    except:
+        pass
+
+    return targets
+
+
+# ===== CDN DETECTION =====
+def detect_cdn(response):
+    r = response.lower()
+
+    if "cloudflare" in r:
+        return "Cloudflare"
+    elif "cloudfront" in r:
+        return "Cloudfront"
+    elif "google" in r or "gws" in r:
+        return "Google"
+    return "Unknown"
+
+
+# ===== SCANNER =====
+def scan_worker(host, timeout, update, context, results):
+    while not q.empty():
+        ip, port = q.get()
+
+        try:
+            sock = socket.create_connection((ip, port), timeout=timeout)
+            context_ssl = ssl.create_default_context()
+            ssock = context_ssl.wrap_socket(sock, server_hostname=host)
+
+            payload = f"GET / HTTP/1.1\r\nHost: {host}\r\n\r\n"
+            ssock.sendall(payload.encode())
+
+            resp = ssock.recv(4096).decode(errors="ignore")
+            ssock.close()
+
+            if "200" in resp or "101" in resp:
+                cdn = detect_cdn(resp)
+                result = f"{ip}:{port} | {cdn}"
+
+                with lock:
+                    results.append(result)
+
+                # send live result
+                context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text=f"✅ {result}"
+                )
+
+        except:
+            pass
+
+        q.task_done()
+
+
+# ===== COMMAND =====
+async def scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        args = context.args
+
+        if len(args) < 3:
+            await update.message.reply_text(
+                "Usage:\n/scan host cidr ports\n\nExample:\n/scan example.com 1.1.1.0/24 443,80"
+            )
+            return
+
+        host = args[0]
+        source = args[1]
+        ports = [int(p) for p in args[2].split(",")]
+        timeout = 5
+        threads = 100
+
+        targets = load_targets(source)
+
+        if not targets:
+            await update.message.reply_text("❌ Invalid target")
+            return
+
+        await update.message.reply_text(
+            f"🚀 Scan started\nTargets: {len(targets)}\nPorts: {ports}"
+        )
+
+        results = []
+
+        # fill queue
+        for ip in targets:
+            for port in ports:
+                q.put((ip, port))
+
+        # start threads
+        for _ in range(threads):
+            threading.Thread(
+                target=scan_worker,
+                args=(host, timeout, update, context, results),
+                daemon=True
+            ).start()
+
+        q.join()
+
+        # save results
+        with tempfile.NamedTemporaryFile(delete=False, mode="w", suffix=".txt") as f:
+            for r in results:
+                f.write(r + "\n")
+            filename = f.name
+
+        await update.message.reply_text("✅ Scan completed")
+
+        # send file
+        await context.bot.send_document(
+            chat_id=update.effective_chat.id,
+            document=open(filename, "rb")
+        )
+
+    except Exception as e:
+        await update.message.reply_text(f"Error: {e}")
+
+
+# ===== START =====
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🤖 HOST SCANNER BOT\n\nUse:\n/scan host cidr ports\n\nExample:\n/scan example.com 1.1.1.0/24 443,80"
+    )
+
+
+# ===== MAIN =====
+def main():
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("scan", scan))
+
+    print("Bot running...")
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    main()                asyncio.open_connection(ip, port), timeout=TIMEOUT
             )
 
             request = f"GET / HTTP/1.1\r\nHost: google.com\r\n\r\n"
