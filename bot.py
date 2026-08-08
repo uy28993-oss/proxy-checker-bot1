@@ -5,7 +5,7 @@ from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 
 # ===== TOKEN =====
-TOKEN = os.getenv(8670058172:AAFm17MDc8FDKk0gTKkdV31hvx3pvDYu80g) 
+TOKEN = os.getenv("TOKEN") 
 TIMEOUT = 3
 CONCURRENCY = 200
 
